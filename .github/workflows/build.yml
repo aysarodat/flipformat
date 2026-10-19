@@ -23,8 +23,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Download the background-removal model
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force models | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net_human_seg.onnx" -OutFile models/u2net_human_seg.onnx
+          $hash = (Get-FileHash models/u2net_human_seg.onnx -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "01eb6a29a5c4d8edb30b56adad9bb3a2a0535338e480724a213e0acfd2d1c73c") { throw "Model checksum mismatch: $hash" }
+
       - name: Build the app
-        run: pyinstaller --noconfirm --windowed --name FlipFormat --collect-all tkinterdnd2 --collect-all pillow_heif --collect-all pillow_avif flipformat.py
+        run: pyinstaller --noconfirm --windowed --name FlipFormat --icon assets/flipformat.ico --add-data "assets;assets" --add-data "models;models" --collect-all tkinterdnd2 --collect-all pillow_heif --collect-all pillow_avif --collect-all onnxruntime flipformat.py
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress

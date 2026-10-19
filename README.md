@@ -9,11 +9,19 @@ Not affiliated with any other converter app. Original code.
 
 - **Convert** between JPG, PNG, WEBP, HEIC, TIFF, BMP, AVIF and PDF.
 - **Shift-drag menu:** select images in Explorer or on the Desktop, hold
-  Shift, drag, and drop onto a format in the menu that appears.
+  Shift, drag, and drop onto a format (or Crop / White BG) in the menu.
 - **Resize** by percent, longest side, width or height.
 - **Max file size (KB):** lowers quality first, then dimensions if needed.
 - **Crop** freely or with presets (US, Schengen/EU, UK, Canada, India, China,
-  Japan, Australia photo sizes and common ratios).
+  Japan, Australia photo sizes and common ratios), with **rotate, flip and
+  straighten**.
+- **White background:** offline AI cut-out with edge clean-up (stray blobs
+  and holes fixed, edges snapped to the photo, old background colour removed
+  from hair edges) onto exact white, light gray, light blue or transparent,
+  with edge shrink/grow and softness controls. Works up to 2400 px on the
+  long side.
+- **Remove metadata:** strips GPS location, camera details and other hidden
+  data (colours are converted to sRGB first so nothing looks dull).
 - Originals are never modified; converted copies are saved beside them.
 
 > Photo preset sizes are the commonly published ones. Rules differ by
@@ -49,5 +57,14 @@ app when you sign in, which keeps the Shift-drag menu ready.
 ## Files
 
 - `flipformat.py`: window, Crop tab and Shift-drag menu
-- `flipformat_core.py`: conversion, resizing, size fitting, crop maths
+- `flipformat_core.py`: conversion, resizing, size fitting, metadata, crop maths
+- `flipformat_bg.py`: background removal
+- `tools/make_icon.py`, `assets/`: the app icon
 - `installer.iss`, `build.bat`, `.github/workflows/build.yml`: packaging
+
+## Credits
+
+The background remover uses the U2-Net human segmentation model
+(Apache-2.0, by Xuebin Qin et al.), run locally with ONNX Runtime. The model
+is not stored in this repo; the build downloads and verifies it. When running
+from source, the app downloads it once on first use (about 176 MB).

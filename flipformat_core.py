@@ -5,7 +5,7 @@ No GUI code lives here, so it can be tested or reused on its own.
 import io
 from pathlib import Path
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageCms, ImageOps
 
 # Optional codecs: HEIC and AVIF come from these plugins.
 try:
@@ -19,6 +19,8 @@ except ImportError:
     pass
 
 RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
+BICUBIC = getattr(Image, "Resampling", Image).BICUBIC
+TRANSPOSE = getattr(Image, "Transpose", Image)
 
 # name -> (extension, Pillow format, save options, needs flat RGB)
 FORMATS = {
@@ -135,7 +137,50 @@ def resize_image(im, mode, value):
     return im.resize(size, RESAMPLE)
 
 
-def encode(im, fmt, quality=None):
+EXIF_FORMATS = {"JPG", "PNG", "WEBP", "HEIC", "AVIF"}
+ICC_FORMATS = {"JPG", "PNG", "WEBP", "TIFF", "HEIC", "AVIF"}
+
+
+def strip_metadata(im):
+    """Return a pixel-only copy: no EXIF/GPS/camera data, XMP or comments.
+
+    Colours are converted to sRGB first, so dropping a wide-gamut profile
+    (e.g. Display P3 from an iPhone) does not make the picture look dull.
+    """
+    icc = im.info.get("icc_profile")
+    if im.mode == "P":
+        im = im.convert("RGBA" if "transparency" in im.info else "RGB")
+    if icc and im.mode in ("RGB", "RGBA"):
+        try:
+            src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+            dst = ImageCms.createProfile("sRGB")
+            rgb = ImageCms.profileToProfile(im.convert("RGB"), src, dst, outputMode="RGB")
+            if im.mode == "RGBA":
+                rgb.putalpha(im.getchannel("A"))
+            im = rgb
+        except Exception:
+            pass  # unreadable profile: keep the pixels as they are
+    return Image.frombytes(im.mode, im.size, im.tobytes())
+
+
+def prepare_metadata(im, strip):
+    """Returns (image, extra save options). With strip=False the original
+    EXIF and colour profile are carried over where the format allows it."""
+    if strip:
+        return strip_metadata(im), {}
+    extra = {}
+    try:
+        exif = im.getexif()
+        if exif:
+            extra["exif"] = exif.tobytes()
+    except Exception:
+        pass
+    if im.info.get("icc_profile"):
+        extra["icc_profile"] = im.info["icc_profile"]
+    return im, extra
+
+
+def encode(im, fmt, quality=None, extra=None):
     """Encode to bytes in memory (needed to measure the file size)."""
     _, pil_fmt, options, flat = FORMATS[fmt]
     if flat:
@@ -143,12 +188,16 @@ def encode(im, fmt, quality=None):
     options = dict(options)
     if quality is not None and fmt in LOSSY:
         options["quality"] = quality
+    for key, value in (extra or {}).items():
+        if (key == "exif" and fmt in EXIF_FORMATS) or (
+                key == "icc_profile" and fmt in ICC_FORMATS):
+            options[key] = value
     buf = io.BytesIO()
     im.save(buf, pil_fmt, **options)
     return buf.getvalue()
 
 
-def fit_to_size(im, fmt, max_kb, allow_downscale=True):
+def fit_to_size(im, fmt, max_kb, allow_downscale=True, extra=None):
     """Encode so the file is at most max_kb.
 
     Returns (bytes, (width, height), note). Lossy formats lower the quality
@@ -156,7 +205,7 @@ def fit_to_size(im, fmt, max_kb, allow_downscale=True):
     scaled down, unless allow_downscale is False (exact-pixel presets).
     """
     limit = int(max_kb * 1024)
-    data = encode(im, fmt)
+    data = encode(im, fmt, extra=extra)
     if len(data) <= limit:
         return data, im.size, None
 
@@ -165,7 +214,7 @@ def fit_to_size(im, fmt, max_kb, allow_downscale=True):
         lo, hi, best = 15, 95, None
         while lo <= hi:
             mid = (lo + hi) // 2
-            candidate = encode(im, fmt, mid)
+            candidate = encode(im, fmt, mid, extra)
             if len(candidate) <= limit:
                 best, lo = candidate, mid + 1
             else:
@@ -174,7 +223,7 @@ def fit_to_size(im, fmt, max_kb, allow_downscale=True):
             return best, im.size, None
 
     if not allow_downscale:
-        smallest = encode(im, fmt, 15) if lossy else data
+        smallest = encode(im, fmt, 15, extra) if lossy else data
         return smallest, im.size, (
             f"could not reach {max_kb} KB without changing the pixel size")
 
@@ -185,30 +234,49 @@ def fit_to_size(im, fmt, max_kb, allow_downscale=True):
         small = im.resize(
             (max(1, round(im.width * scale)), max(1, round(im.height * scale))),
             RESAMPLE)
-        candidate = encode(small, fmt, quality)
+        candidate = encode(small, fmt, quality, extra)
         if len(candidate) <= limit:
             return candidate, small.size, (
                 f"scaled to {small.width}x{small.height} to fit")
     return candidate, small.size, f"could not reach {max_kb} KB"
 
 
-def save_image(im, src, fmt, max_kb=0, suffix="", allow_downscale=True):
-    """Write im beside src in the chosen format. Returns (path, size, note)."""
+def save_image(im, src, fmt, max_kb=0, suffix="", allow_downscale=True, strip=True):
+    """Write im beside src in the chosen format. Returns (path, size, note).
+    strip=True removes EXIF/GPS/camera data (recommended before sharing)."""
     src = Path(src)
+    im, extra = prepare_metadata(im, strip)
     if max_kb:
-        data, size, note = fit_to_size(im, fmt, max_kb, allow_downscale)
+        data, size, note = fit_to_size(im, fmt, max_kb, allow_downscale, extra)
     else:
-        data, size, note = encode(im, fmt), im.size, None
+        data, size, note = encode(im, fmt, extra=extra), im.size, None
     out = unique_path(src.with_name(src.stem + suffix + FORMATS[fmt][0]))
     out.write_bytes(data)
     return out, size, note
 
 
-def convert(src, fmt, resize_mode="Original size", resize_value=0, max_kb=0):
+def convert(src, fmt, resize_mode="Original size", resize_value=0, max_kb=0, strip=True):
     """Convert one file. The original is never modified."""
     im = load_image(src)
     im = resize_image(im, resize_mode, resize_value)
-    return save_image(im, src, fmt, max_kb)
+    return save_image(im, src, fmt, max_kb, strip=strip)
+
+
+# ------------------------------------------------------- rotate / flip
+
+def rotate90(im, clockwise=True):
+    return im.transpose(TRANSPOSE.ROTATE_270 if clockwise else TRANSPOSE.ROTATE_90)
+
+
+def flip(im, horizontal=True):
+    return ImageOps.mirror(im) if horizontal else ImageOps.flip(im)
+
+
+def straighten(im, degrees):
+    """Fine rotation (positive = counter-clockwise); corners become transparent."""
+    if not degrees:
+        return im
+    return im.convert("RGBA").rotate(degrees, resample=BICUBIC, expand=False)
 
 
 # ---------------------------------------------------------------- cropping

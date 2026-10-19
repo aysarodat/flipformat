@@ -4,9 +4,9 @@ Run:  python flipformat.py
 
 Shift-drag menu: keep this window open (you can minimise it). In Explorer or
 on the Desktop, select image(s), hold Shift, and drag. A format menu pops up
-under the cursor; drop the files on a format to convert. Drop on "Edit..." to
-open the first image in the Crop tab. Originals are never modified and
-nothing is ever uploaded.
+under the cursor; drop the files on a format to convert. "Crop..." and
+"White BG..." open the first image in those tabs. Originals are never
+modified and nothing is ever uploaded.
 """
 import ctypes
 import queue
@@ -16,7 +16,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, ttk
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -26,8 +26,13 @@ except ImportError:
 from flipformat_core import (
     CROP_PRESETS, FORMATS, INPUT_EXTS, RESAMPLE, RESIZE_MODES,
     anchored_box, available_formats, centered_box, convert, crop_and_resize,
-    load_image, preset_ratio, save_image,
+    flip, load_image, preset_ratio, rotate90, save_image, straighten,
 )
+
+try:
+    import flipformat_bg as bg
+except ImportError:  # numpy / onnxruntime not installed
+    bg = None
 
 IS_WIN = sys.platform == "win32"
 ACCENT = "#ff9f1c"
@@ -79,6 +84,29 @@ if IS_WIN:
         user32.SetWindowLongW(hwnd, -20, style | 0x08000000 | 0x00000080)
 
 
+def resource(*parts):
+    """Path to a bundled file (works from source and inside the installer)."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base.joinpath(*parts)
+
+
+def fit_to(im, width, height):
+    scale = min(width / im.width, height / im.height)
+    return im.resize((max(1, round(im.width * scale)), max(1, round(im.height * scale))),
+                     Image.Resampling.LANCZOS)
+
+
+def checkerboard(size, cell=12):
+    """Grey squares, to show transparency."""
+    w, h = size
+    img = Image.new("RGB", size, (204, 204, 204))
+    d = ImageDraw.Draw(img)
+    for y in range(0, h, cell):
+        for x in range((y // cell) % 2 * cell, w, cell * 2):
+            d.rectangle((x, y, x + cell - 1, y + cell - 1), fill=(240, 240, 240))
+    return img
+
+
 def to_int(text):
     try:
         return max(0, int(float(str(text).strip())))
@@ -94,7 +122,9 @@ class ShiftDragMenu:
     no hooks and no extra dependencies."""
 
     ALLOWED = {"CabinetWClass", "Progman", "WorkerW"}  # Explorer, Desktop
-    GRID = ["JPG", "PNG", "WEBP", "HEIC", "TIFF", "BMP", "AVIF", "PDF", "Edit"]
+    GRID = ["JPG", "PNG", "WEBP", "HEIC", "TIFF", "BMP", "AVIF", "PDF", "Crop", "Background"]
+    TOOLS = {"Crop", "Background"}
+    LABELS = {"Crop": "Crop...", "Background": "White BG..."}
 
     def __init__(self, app):
         self.app, self.root, self.k = app, app.root, app.k
@@ -112,16 +142,16 @@ class ShiftDragMenu:
         body.pack()
         self.header = tk.Label(body, text="", bg=DARK, fg="white",
                                font=("Segoe UI", 10, "bold"))
-        self.header.grid(row=0, column=0, columnspan=3, pady=(0, 6))
+        self.header.grid(row=0, column=0, columnspan=4, pady=(0, 6))
 
         self.pills = {}
         for i, name in enumerate(self.GRID):
-            ok = name == "Edit" or name in app.ready
-            lbl = tk.Label(body, text="Edit..." if name == "Edit" else name,
+            ok = name in self.TOOLS or name in app.ready
+            lbl = tk.Label(body, text=self.LABELS.get(name, name),
                            width=9, pady=8, bg=PILL,
                            fg="white" if ok else "#777777",
                            font=("Segoe UI", 10, "bold"))
-            lbl.grid(row=1 + i // 3, column=i % 3, padx=3, pady=3)
+            lbl.grid(row=1 + i // 4, column=i % 4, padx=3, pady=3)
             self.pills[name] = lbl
             if ok:
                 lbl.drop_target_register(DND_FILES)
@@ -202,9 +232,12 @@ class ShiftDragMenu:
         if not files:
             self.header.configure(text="No supported images in that drop")
             self.hide_later(1800)
-        elif name == "Edit":
+        elif name == "Crop":
             self.hide()
-            self.app.open_in_editor(files)
+            self.app.open_in_crop(files)
+        elif name == "Background":
+            self.hide()
+            self.app.open_in_background(files)
         else:
             self.busy = True
             self.header.configure(text=f"Converting {len(files)} file(s)...")
@@ -226,8 +259,10 @@ class CropTab(ttk.Frame):
         super().__init__(parent, padding=10)
         self.app = app
         k = app.k
-        self.cw, self.ch = int(480 * k), int(330 * k)
-        self.im = self.path = self.photo = self.box = None
+        self.cw, self.ch = int(480 * k), int(300 * k)
+        self.im = self.path = self.photo = self.thumb = self.box = None
+        self.meta = {}
+        self.angle = 0.0
         self.scale, self.ox, self.oy, self.dw, self.dh = 1, 0, 0, 1, 1
         self.mode, self.anchor, self.grab = None, (0, 0), (0, 0)
 
@@ -240,6 +275,25 @@ class CropTab(ttk.Frame):
         self.preset_cb.current(0)
         self.preset_cb.pack(side="left", padx=8)
         self.preset_cb.bind("<<ComboboxSelected>>", lambda e: self.on_preset(reset=True))
+
+        tools = ttk.Frame(self)
+        tools.pack(fill="x", pady=(6, 0))
+        for text, fn in (("Rotate left", lambda: self.turn(False)),
+                         ("Rotate right", lambda: self.turn(True)),
+                         ("Flip H", lambda: self.mirror(True)),
+                         ("Flip V", lambda: self.mirror(False))):
+            ttk.Button(tools, text=text, command=fn, width=11).pack(side="left", padx=(0, 4))
+
+        straight = ttk.Frame(self)
+        straight.pack(fill="x", pady=(4, 0))
+        ttk.Label(straight, text="Straighten").pack(side="left")
+        self.angle_var = tk.DoubleVar(value=0.0)
+        ttk.Scale(straight, from_=-15, to=15, variable=self.angle_var,
+                  command=self.on_angle).pack(side="left", fill="x", expand=True, padx=8)
+        self.angle_label = ttk.Label(straight, text="0.0 deg", width=9)
+        self.angle_label.pack(side="left")
+        ttk.Button(straight, text="Reset", width=6,
+                   command=lambda: self.reset_angle(True)).pack(side="left", padx=(4, 0))
 
         self.canvas = tk.Canvas(self, width=self.cw, height=self.ch, bg="#2b2b2b",
                                 highlightthickness=0, cursor="crosshair")
@@ -267,6 +321,8 @@ class CropTab(ttk.Frame):
         self.kb_var = tk.StringVar(value="0")
         ttk.Entry(bottom, textvariable=self.kb_var, width=7).pack(side="left", padx=4)
         ttk.Button(bottom, text="Crop and save", command=self.save).pack(side="right")
+        ttk.Checkbutton(self, text="Remove metadata (GPS location, camera info)",
+                        variable=app.strip_var).pack(anchor="w", pady=(6, 0))
 
     # -- helpers -----------------------------------------------------------
     def preset(self):
@@ -304,15 +360,62 @@ class CropTab(ttk.Frame):
         except Exception as exc:
             self.info.configure(text=f"Cannot open that file: {exc}")
             return
+        self.set_image(im, path)
+
+    def set_image(self, im, path):
+        """Show a PIL image for cropping. path is only used to name the output."""
         self.im, self.path = im, Path(path)
+        self.meta = {k: im.info[k] for k in ("exif", "icc_profile") if k in im.info}
+        self.reset_angle()
+        self.rebuild()
+
+    def rebuild(self):
+        im = self.im
         self.scale = min(self.cw / im.width, self.ch / im.height)
         self.dw = max(1, round(im.width * self.scale))
         self.dh = max(1, round(im.height * self.scale))
         self.ox, self.oy = (self.cw - self.dw) // 2, (self.ch - self.dh) // 2
-        thumb = im.convert("RGBA").resize((self.dw, self.dh), RESAMPLE)
-        self.photo = ImageTk.PhotoImage(thumb)
+        self.thumb = im.convert("RGBA").resize((self.dw, self.dh), RESAMPLE)
+        self.update_photo()
         self.box = None
         self.on_preset(reset=True)
+
+    def update_photo(self):
+        shown = straighten(self.thumb, self.angle) if self.angle else self.thumb
+        self.photo = ImageTk.PhotoImage(shown)
+
+    # -- rotate / flip / straighten -------------------------------------------
+    def turn(self, clockwise):
+        if self.im is None:
+            return
+        self.im = rotate90(self.im, clockwise)
+        self.reset_angle()
+        self.rebuild()
+
+    def mirror(self, horizontal):
+        if self.im is None:
+            return
+        self.im = flip(self.im, horizontal)
+        self.reset_angle()
+        self.rebuild()
+
+    def reset_angle(self, redraw=False):
+        self.angle = 0.0
+        self.angle_var.set(0.0)
+        self.angle_label.configure(text="0.0 deg")
+        if redraw and self.im is not None:
+            self.update_photo()
+            self.redraw()
+
+    def on_angle(self, value):
+        angle = round(float(value) * 2) / 2  # snap to half degrees
+        if angle == self.angle:
+            return
+        self.angle = angle
+        self.angle_label.configure(text=f"{angle:+.1f} deg")
+        if self.im is not None:
+            self.update_photo()
+            self.redraw()
 
     def on_preset(self, reset=False):
         preset = self.preset()
@@ -359,11 +462,9 @@ class CropTab(ttk.Frame):
         if self.im is None:
             return
         reach = self.HANDLE * 2 * self.app.k
-        corners = self.corners_canvas()
-        for i, (hx, hy) in enumerate(corners):
+        for i, (hx, hy) in enumerate(self.corners_canvas()):
             if abs(e.x - hx) <= reach and abs(e.y - hy) <= reach:
-                ox, oy = self.canvas_to_img_corner(i)
-                self.mode, self.anchor = "anchor", (ox, oy)
+                self.mode, self.anchor = "anchor", self.opposite_corner(i)
                 return
         ix, iy = self.to_img(e.x, e.y)
         x0, y0, x1, y1 = self.box
@@ -372,8 +473,7 @@ class CropTab(ttk.Frame):
         else:
             self.mode, self.anchor = "anchor", (ix, iy)
 
-    def canvas_to_img_corner(self, i):
-        """Image coordinates of the corner opposite to handle i."""
+    def opposite_corner(self, i):
         x0, y0, x1, y1 = self.box
         pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
         return pts[(i + 2) % 4]
@@ -402,10 +502,12 @@ class CropTab(ttk.Frame):
         preset = self.preset()
         px = preset.get("px")
         try:
-            cropped = crop_and_resize(self.im, self.box, px)
+            work = straighten(self.im, self.angle) if self.angle else self.im
+            cropped = crop_and_resize(work, self.box, px)
+            cropped.info.update(self.meta)  # only written if "Remove metadata" is off
             out, size, note = save_image(
                 cropped, self.path, self.fmt_var.get(), to_int(self.kb_var.get()),
-                suffix="_crop", allow_downscale=not px)
+                suffix="_crop", allow_downscale=not px, strip=self.app.strip_var.get())
             kb = out.stat().st_size / 1024
             text = f"Saved {out.name}  ({size[0]}x{size[1]} px, {kb:.0f} KB)"
             if note:
@@ -413,6 +515,214 @@ class CropTab(ttk.Frame):
             self.info.configure(text=text)
         except Exception as exc:
             self.info.configure(text=f"Failed: {exc}")
+
+
+# ----------------------------------------------------------- White background tab
+
+class BackgroundTab(ttk.Frame):
+    SUFFIX = {"White": "_white", "Light gray": "_gray", "Light blue": "_blue",
+              "Transparent": "_cutout"}
+
+    def __init__(self, parent, app):
+        super().__init__(parent, padding=10)
+        self.app = app
+        k = app.k
+        self.cw, self.ch = int(480 * k), int(310 * k)
+        self.src = self.src_small = self.path = self.cutout = self.photo = None
+        self.busy, self.job = False, None
+
+        top = ttk.Frame(self)
+        top.pack(fill="x")
+        ttk.Button(top, text="Open image...", command=self.browse).pack(side="left")
+        self.run_btn = ttk.Button(top, text="Remove background", command=self.run)
+        self.run_btn.pack(side="left", padx=8)
+        self.compare = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="Show original", variable=self.compare,
+                        command=self.refresh).pack(side="left")
+
+        self.canvas = tk.Canvas(self, width=self.cw, height=self.ch, bg="#2b2b2b",
+                                highlightthickness=0)
+        self.canvas.pack(pady=8)
+        self.canvas.create_text(self.cw // 2, self.ch // 2, fill="#aaaaaa",
+                                font=("Segoe UI", 12), text="Drop a portrait here")
+        self.canvas.drop_target_register(DND_FILES)
+        self.canvas.dnd_bind("<<Drop>>", self.on_drop)
+
+        ctl = ttk.Frame(self)
+        ctl.pack(fill="x")
+        ctl.columnconfigure(1, weight=1)
+        ttk.Label(ctl, text="Background").grid(row=0, column=0, sticky="w")
+        self.color_var = tk.StringVar(value="White")
+        color_cb = ttk.Combobox(ctl, textvariable=self.color_var, state="readonly",
+                                values=list(bg.BACKGROUNDS) if bg else ["White"], width=14)
+        color_cb.grid(row=0, column=1, sticky="w", padx=8)
+        color_cb.bind("<<ComboboxSelected>>", self.on_color)
+        self.edge_var, self.soft_var = tk.DoubleVar(value=0), tk.DoubleVar(value=1)
+        for row, (label, var, lo, hi) in enumerate(
+                (("Edge (shrink / grow)", self.edge_var, -4, 4),
+                 ("Edge softness", self.soft_var, 0, 4)), start=1):
+            ttk.Label(ctl, text=label).grid(row=row, column=0, sticky="w")
+            ttk.Scale(ctl, from_=lo, to=hi, variable=var,
+                      command=lambda v: self.schedule()).grid(
+                row=row, column=1, sticky="ew", padx=8, pady=2)
+
+        self.info = ttk.Label(self, text="Open a portrait, then press Remove background.",
+                              wraplength=int(480 * k))
+        self.info.pack(fill="x", pady=(6, 0))
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", pady=(8, 0))
+        ttk.Label(bottom, text="Save as").pack(side="left")
+        self.fmt_var = tk.StringVar(value="JPG")
+        ttk.Combobox(bottom, textvariable=self.fmt_var, state="readonly", width=6,
+                     values=app.ready).pack(side="left", padx=(4, 12))
+        ttk.Label(bottom, text="Max KB").pack(side="left")
+        self.kb_var = tk.StringVar(value="0")
+        ttk.Entry(bottom, textvariable=self.kb_var, width=6).pack(side="left", padx=4)
+        ttk.Button(bottom, text="Save", command=lambda: self.finish("save")).pack(side="right")
+        ttk.Button(bottom, text="Crop this", command=lambda: self.finish("crop")).pack(
+            side="right", padx=6)
+
+    # -- loading -----------------------------------------------------------
+    def browse(self):
+        types = " ".join(f"*{e}" for e in sorted(INPUT_EXTS))
+        picked = filedialog.askopenfilename(
+            title="Choose a portrait", filetypes=[("Images", types)])
+        if picked:
+            self.load(picked)
+
+    def on_drop(self, event):
+        paths = [Path(p) for p in self.app.root.tk.splitlist(event.data)]
+        paths = [p for p in paths if p.suffix.lower() in INPUT_EXTS]
+        if paths:
+            self.load(paths[0])
+        return "copy"
+
+    def load(self, path):
+        try:
+            self.src = load_image(path)
+        except Exception as exc:
+            self.info.configure(text=f"Cannot open that file: {exc}")
+            return
+        self.path, self.cutout = Path(path), None
+        self.src_small = fit_to(self.src.convert("RGB"), self.cw, self.ch)
+        self.compare.set(False)
+        self.info.configure(text=f"{self.path.name}: press Remove background.")
+        self.refresh()
+
+    # -- processing --------------------------------------------------------
+    def say(self, text):
+        self.info.configure(text=text)
+
+    def set_busy(self, busy):
+        self.busy = busy
+        self.run_btn.state(["disabled"] if busy else ["!disabled"])
+
+    def run(self):
+        if self.busy:
+            return
+        if self.src is None:
+            self.say("Open an image first.")
+            return
+        if bg is None:
+            self.say("Missing packages. Run: pip install -r requirements.txt")
+            return
+        self.set_busy(True)
+        src = self.src
+
+        def work():
+            try:
+                note = lambda t: self.app.post(self.say, t)  # noqa: E731
+                matter = self.app.get_matter(note)
+                cut = bg.cut_out(matter, src, note)
+                self.app.post(self.done, cut)
+            except Exception as exc:
+                self.app.post(self.fail, str(exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def done(self, cutout):
+        self.cutout = cutout
+        self.set_busy(False)
+        w, h = cutout.size
+        self.say(f"Done ({w}x{h} px working size). Fine-tune the edge if you like, "
+                 "then Save or Crop this.")
+        self.refresh()
+
+    def fail(self, message):
+        self.set_busy(False)
+        self.say(f"Could not remove the background: {message}")
+
+    # -- preview -------------------------------------------------------------
+    def settings(self):
+        color = bg.BACKGROUNDS[self.color_var.get()] if bg else (255, 255, 255)
+        return color, self.edge_var.get(), self.soft_var.get()
+
+    def on_color(self, _event=None):
+        if self.color_var.get() == "Transparent":
+            self.fmt_var.set("PNG")
+        self.schedule()
+
+    def schedule(self):
+        if self.job:
+            self.after_cancel(self.job)
+        self.job = self.after(60, self.refresh)
+
+    def refresh(self):
+        self.job = None
+        if self.src is None:
+            return
+        if self.cutout is None or self.compare.get():
+            img = self.src_small
+        else:
+            img = fit_to(self.cutout.render(*self.settings(), preview=True), self.cw, self.ch)
+        if img.mode == "RGBA":
+            base = checkerboard(img.size)
+            base.paste(img, mask=img.split()[-1])
+            img = base
+        self.photo = ImageTk.PhotoImage(img)
+        self.canvas.delete("all")
+        self.canvas.create_image(self.cw // 2, self.ch // 2, image=self.photo)
+
+    # -- output --------------------------------------------------------------
+    def finish(self, action):
+        if self.busy:
+            return
+        if self.cutout is None:
+            self.say("Press Remove background first.")
+            return
+        color, edge, soft = self.settings()
+        fmt, max_kb = self.fmt_var.get(), to_int(self.kb_var.get())
+        strip, path, cutout = self.app.strip_var.get(), self.path, self.cutout
+        suffix = self.SUFFIX[self.color_var.get()]
+        self.set_busy(True)
+        self.say("Rendering at full quality...")
+
+        def work():
+            try:
+                final = cutout.render(color, edge, soft)
+                if action == "crop":
+                    self.app.post(self.to_crop, final, path)
+                else:
+                    out, size, note = save_image(final, path, fmt, max_kb,
+                                                 suffix=suffix, strip=strip)
+                    self.app.post(self.saved, out, size, note)
+            except Exception as exc:
+                self.app.post(self.fail, str(exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def saved(self, out, size, note):
+        self.set_busy(False)
+        kb = out.stat().st_size / 1024
+        text = f"Saved {out.name}  ({size[0]}x{size[1]} px, {kb:.0f} KB)"
+        self.say(text + (f"  - {note}" if note else ""))
+
+    def to_crop(self, image, path):
+        self.set_busy(False)
+        self.say("Sent to the Crop tab.")
+        self.app.crop_tab.set_image(image, path)
+        self.app.nb.select(self.app.crop_tab)
 
 
 # ---------------------------------------------------------------------- App
@@ -425,15 +735,20 @@ class App:
         self.files = []
         self.busy = False
         self.q = queue.Queue()
+        self.matter = None
+        self.strip_var = tk.BooleanVar(value=True)
         root.title("FlipFormat")
-        root.minsize(int(540 * self.k), int(660 * self.k))
+        self.set_icon()
+        root.minsize(int(540 * self.k), int(700 * self.k))
 
         self.nb = ttk.Notebook(root)
         self.nb.pack(fill="both", expand=True, padx=10, pady=10)
         self.convert_tab = ttk.Frame(self.nb, padding=10)
         self.crop_tab = CropTab(self.nb, self)
         self.nb.add(self.convert_tab, text="Convert")
+        self.bg_tab = BackgroundTab(self.nb, self)
         self.nb.add(self.crop_tab, text="Crop")
+        self.nb.add(self.bg_tab, text="White background")
         self.build_convert_tab()
 
         self.menu = ShiftDragMenu(self) if IS_WIN else None
@@ -469,6 +784,8 @@ class App:
         ttk.Label(row2, text="Max file size (KB, 0 = no limit)").pack(side="left")
         self.kb_var = tk.StringVar(value="0")
         ttk.Entry(row2, textvariable=self.kb_var, width=7).pack(side="left", padx=6)
+        ttk.Checkbutton(opts, text="Remove metadata (GPS location, camera info)",
+                        variable=self.strip_var).pack(anchor="w", pady=(6, 0))
         self.shift_var = tk.BooleanVar(value=IS_WIN)
         chk = ttk.Checkbutton(opts, text="Enable Shift-drag menu (Windows)",
                               variable=self.shift_var)
@@ -523,7 +840,8 @@ class App:
     def options(self):
         return {"resize_mode": self.mode_var.get(),
                 "resize_value": to_int(self.val_var.get()),
-                "max_kb": to_int(self.kb_var.get())}
+                "max_kb": to_int(self.kb_var.get()),
+                "strip": self.strip_var.get()}
 
     def menu_caption(self):
         o = self.options()
@@ -532,6 +850,8 @@ class App:
             bits.append(f"{o['resize_mode'].lower()} {o['resize_value']}")
         if o["max_kb"]:
             bits.append(f"max {o['max_kb']} KB")
+        if o["strip"]:
+            bits.append("metadata removed")
         return "Drop on a format" + (" - " + ", ".join(bits) if bits else "")
 
     # -- conversion --------------------------------------------------------
@@ -580,11 +900,39 @@ class App:
     def post(self, fn, *args):
         self.q.put((fn, args))
 
-    def open_in_editor(self, files):
+    def bring_to_front(self, tab):
         self.root.deiconify()
         self.root.lift()
-        self.nb.select(self.crop_tab)
+        self.nb.select(tab)
+
+    def open_in_crop(self, files):
+        self.bring_to_front(self.crop_tab)
         self.crop_tab.load(files[0])
+
+    def open_in_background(self, files):
+        self.bring_to_front(self.bg_tab)
+        self.bg_tab.load(files[0])
+
+    def set_icon(self):
+        try:
+            if IS_WIN:
+                self.root.iconbitmap(default=str(resource("assets", "flipformat.ico")))
+            else:
+                self.root.iconphoto(True, tk.PhotoImage(file=str(resource("assets", "icon.png"))))
+        except Exception:
+            pass  # a missing icon should never stop the app
+
+    def get_matter(self, progress):
+        """Load the AI model once (downloads it first if it is not bundled)."""
+        if self.matter is None:
+            path = bg.find_model()
+            if path is None:
+                progress("Downloading the AI model (one time, about 176 MB)...")
+                path = bg.download_model(
+                    lambda f: progress(f"Downloading the AI model... {int(f * 100)}%"))
+            progress("Loading the AI model...")
+            self.matter = bg.Matter(path)
+        return self.matter
 
     def tick(self):
         try:
